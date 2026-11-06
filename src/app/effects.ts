@@ -32,19 +32,24 @@ interface Handler<K extends EffectKind> {
   retry: readonly [number, number]
   /** Effects run one at a time in queue order, and a failed one holds back later rows of the same kind. */
   ordered: boolean
+  /** When true, a row of this kind ages: it waits one step more urgent every day, so the least urgent row does not starve. */
+  aged: boolean
   /** When true, repeated failures do not mark the effect kind's health entry as `error` (used when failures are already surfaced on a ticket). */
   quiet: boolean
 }
-type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet'>>
+type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'aged' | 'quiet'>>
 /** `seq` preserves the row's queue position; `generation` increments on payload updates so a running attempt does not delete a newer payload. */
 interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number }
 type Task = { kind: EffectKind; key: string; done: Promise<void> }
+/** How long a row waits before it becomes one step more urgent, so the least urgent row of a queue does not starve. */
+export const AGEING_MS = 24 * 3600_000
 
 /**
  * Durable SQLite-backed queue that persists side effects inside command transactions and dispatches them after commit.
  * Coordinates per-kind handlers, concurrency limits, exponential backoff, and health reporting for MasterAssessor, DshExecutor, Sessions, and Outbox.
  * The rows of a kind wait in the order they were queued, and the most urgent row first: a row states the priority it waits with,
  * which the launch queue takes from the ticket it launches, so a more urgent ticket starts before an older, less urgent one.
+ * A kind that ages makes a row one step more urgent every day it waits, so the least urgent work of a busy queue does not starve.
  */
 export class Effects {
   private readonly handlers = new Map<EffectKind, Handler<never>>()
@@ -78,8 +83,8 @@ export class Effects {
   handle<K extends EffectKind>(kind: K, run: Handler<K>['run'], options: Options<K> = {}): void {
     if (this.handlers.has(kind)) throw new Error(`The ${kind} effects already have a handler`)
     this.health.set(kind, this.board.claim(kind))
-    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false } = options
-    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet } as unknown as Handler<never>)
+    const { limit = () => 1, retry = [2000, 60_000], ordered = false, aged = false, quiet = false } = options
+    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, aged, quiet } as unknown as Handler<never>)
     this.report(kind)
     this.kick()
   }
@@ -119,8 +124,13 @@ export class Effects {
         // Ordered kinds block behind their oldest row even when it is not yet due; limit() is queried only after ready rows exist.
         const rows = (handler.ordered
           ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
-          : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY priority, seq LIMIT ?')
-            .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
+          : handler.aged
+            // A row that waits a day longer waits one step more urgent, so the least urgent row of a queue does not starve.
+            ? this.store.db.prepare(`SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ?
+              ORDER BY MAX(0, priority - CAST((? - CAST(strftime('%s', since) AS INTEGER)) / ${AGEING_MS / 1000} AS INTEGER)), seq LIMIT ?`)
+              .all(kind, this.now(), Math.floor(this.now() / 1000), 16 + running.size)
+            : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY priority, seq LIMIT ?')
+              .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
         const ready = handler.ordered && running.size ? [] : rows.filter(row => row.due <= this.now() && !running.has(row.key))
         let room = ready.length ? handler.limit() - running.size : 0
         for (const row of ready) {

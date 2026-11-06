@@ -59,6 +59,21 @@ describe('the durable launch queue', () => {
     expect(run.mock.calls.map(([, key]) => key)).toEqual(['second', 'first'])
   })
 
+  it('makes a row that waits long enough more urgent, so the least urgent work does not starve', async () => {
+    const run = vi.fn(async (_payload: { ticketId: string; assignmentId: string }, _key: string) => {})
+    let room = 0
+    effects.handle('launch', run, { limit: () => room, aged: true })
+    effects.enqueue('launch', 'least', launch('least'), 4)
+    await effects.idle()
+    expect(run).not.toHaveBeenCalled()
+    // Four days of waiting make the least urgent row as urgent as the most urgent one queued today.
+    clock += 4 * 24 * 3600_000
+    effects.enqueue('launch', 'urgent', launch('urgent'), 1)
+    room = 1
+    await effects.idle()
+    expect(run.mock.calls.map(([, key]) => key)).toEqual(['least', 'urgent'])
+  })
+
   it('keeps the waiting rows and their priorities across a restart', async () => {
     const run = vi.fn(async () => {})
     let room = 0

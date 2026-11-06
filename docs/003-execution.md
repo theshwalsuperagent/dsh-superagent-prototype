@@ -60,7 +60,7 @@ The configured concurrency limit applies to these slots, with one extra slot for
 
 Other Inputs, such as CI results, wait for a normal slot. A launch waits in `working / queued` until a slot is free. Launches run concurrently, so a slow prepare command delays only its own Ticket.
 
-Which launch takes a freed slot follows the priority the Source states for the Ticket: the most urgent first, from `P0` to `P4`, and the oldest first among the Tickets of one priority. A GitHub Issue or pull request states its priority with a `priority/P0` … `priority/P4` label, and a Ticket whose Source states none waits at `P2`. A label that changes while the Ticket waits moves it in the queue, without a new Ticket or Assignment. A launch that started keeps the place it started in: no Ticket is ever preempted.
+Which launch takes a freed slot follows the priority the Source states for the Ticket: the most urgent first, from `P0` to `P4`, and the oldest first among the Tickets of one priority. A GitHub Issue or pull request states its priority with a `priority/P0` … `priority/P4` label, and a Ticket whose Source states none waits at `P2`. A label that changes while the Ticket waits moves it in the queue, without a new Ticket or Assignment. A launch that started keeps the place it started in: no Ticket is ever preempted. A launch that waits a day longer waits one step more urgent, so the least urgent Ticket of a busy queue does not starve behind a constant flow of more urgent ones.
 
 ### Execution variables
 
