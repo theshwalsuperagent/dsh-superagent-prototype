@@ -1,6 +1,7 @@
 /** Ports the core depends on. Sources, policies, assessors, executors, and channels are project-specific. */
 import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
   from './model.ts'
+import type { Priority } from './priority.ts'
 import type { Reason } from './reasons.ts'
 
 /** Gate admission result: either inadmissible with a reason code, or admissible with strength and MandateBasis. */
@@ -66,6 +67,11 @@ export interface Executor {
   deliver(ticket: Ticket, assignment: Assignment): void
   /** End an assignment's work, such as cancelling its Session's turn; called after the ticket or assignment has already ended in the domain. */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void
+  /**
+   * Move the launch a waiting ticket has queued to another priority, which changes the place it waits in the queue.
+   * A launch that started keeps the place it started in, so an Executor leaves it alone.
+   */
+  reprioritize?(ticket: Ticket, priority: Priority): void
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */

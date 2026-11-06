@@ -1,5 +1,6 @@
 /** Domain model of a proactive agent: the concepts and their invariants, independent of any source, policy, or executor. */
 import type { Reason } from './reasons.ts'
+import type { Priority } from './priority.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
 export interface ActorRef { source: string; id: string }
@@ -30,6 +31,11 @@ export interface Trigger {
   human: boolean
   /** Source-declared: the sender addressed the agent, by mentioning it or in a direct message to it. */
   addressed?: 'mention' | 'direct'
+  /**
+   * Source-declared: how urgent the work this trigger may start is, such as an issue's `priority/P1` label.
+   * The launch queue starts the most urgent ticket first; a trigger that states none leaves its ticket at the default.
+   */
+  priority?: Priority
   at: string
   text: string
   channel?: ChannelRef
@@ -301,6 +307,8 @@ export interface Ticket {
   updatedAt: string
   /** The Triggers it was accepted from: the one that started it, and the batch its Eval held. */
   origin: { triggerId: string; triggerIds: string[] }
+  /** How urgent the work is, which orders its launch in the queue; the Source states it, and `P2` is the default. */
+  priority?: Priority
   /** What its Executor chose: its short name, directory and assignment text. */
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */

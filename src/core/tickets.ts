@@ -2,6 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import { DEFAULT_PRIORITY, type Priority } from './priority.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
   Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
@@ -40,8 +41,10 @@ export class Tickets extends EnginePart {
     // Fall back to the last trigger for Evals recorded before `primary` existed.
     const primary = this.repo.triggers.get(evaluation.primary ?? triggerIds.at(-1)!)
     const origin = { triggerId: primary?.id ?? triggerIds[0]!, triggerIds }
+    // The Source states how urgent the work is; a ticket whose trigger states none waits at the default priority.
+    const priority = primary?.priority ?? DEFAULT_PRIORITY
     let ticket: Ticket = { id, title: outcome.title, decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
-      createdAt: at, updatedAt: at, origin }
+      createdAt: at, updatedAt: at, origin, priority }
     for (const triggerId of triggerIds) {
       const channel = this.repo.triggers.get(triggerId)?.channel
       if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
@@ -177,6 +180,20 @@ export class Tickets extends EnginePart {
     this.options.executor.stop(ticket, latest, 'retried')
     this.options.executor.start(ticket, assignment)
     return ticket
+  }
+  /**
+   * Record the priority a Source states for a ticket's work: a ticket that waits for its launch takes its new place in the
+   * queue, without a new ticket or assignment, and one whose launch already started keeps the place it started in.
+   */
+  setPriority(ticketId: string, priority: Priority): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket) || ticket.priority === priority) return
+    // A launch that started is never reordered.
+    if (runningAssignment(ticket)) return
+    ticket.priority = priority
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    this.options.executor.reprioritize?.(ticket, priority)
   }
   /**
    * Drops a ticket's Subscription to a Thread its worker found unrelated, and hands back, with `reason`, the person's messages there that the ticket decides.

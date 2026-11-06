@@ -1,12 +1,15 @@
 /** GitHub source kind definition, notification and repository polling loops, and Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
 import { key, type Thread } from '../core/index.ts'
+import { DEFAULT_PRIORITY } from '../core/priority.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
 import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
+import type { GithubIssue } from './github-trigger.ts'
+import { priorityOfLabels } from './github-priority.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
@@ -146,10 +149,10 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 }
 interface Round {
   started: string; signal?: AbortSignal | undefined
-  pulls: Map<number, Promise<Pull>>; read: Set<number>; failures: string[]; dropped: number[]; abandoned: number[]
-  tally: Tally
+  pulls: Map<number, Promise<Pull>>; issues: Map<number, Promise<GithubIssue>>; read: Set<number>; failures: string[]; dropped: number[]
+  abandoned: number[]; tally: Tally
 }
-const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
+const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), issues: new Map(), read: new Set(),
   failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
@@ -282,6 +285,7 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
+  await syncPriorities(ctx, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error
   const { count, interval } = notified.value
@@ -344,14 +348,14 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
   let isPr = item.pr
+  const { login } = ctx.deployment.github
   if (!isPr) {
-    const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
+    const issue = await readIssue(ctx, round, number)
     // `issues/<n>` also returns PRs with `pull_request` set; handle them in the PR branch below.
     isPr = !!issue.pull_request
     if (!isPr) {
       // An Issue opened by someone other than the agent since the cursor brings its body so a mention in it reaches the gate.
       // A mention added by a later edit to the body is not read: only the author can be the actor of the body.
-      const { login } = ctx.deployment.github
       const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
       if (opened) await ctx.receive(issueTrigger(issue, login))
       await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
@@ -361,9 +365,10 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
   if (isPr) {
     const pr = await pull(ctx, round, number)
     // Emit a PR description trigger for PRs opened since the cursor; its ID is the same as the one produced by the repository PR stream.
-    const { login } = ctx.deployment.github
     if (pr.created_at && Date.parse(pr.created_at) >= Date.parse(since) && !sameName(pr.user.login, login)) {
-      const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url }
+      // The Issue endpoint carries the labels of a pull request, which state the priority of the work it starts.
+      const labels = (await readIssue(ctx, round, number)).labels
+      const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url, labels }
       await ctx.receive(pullTrigger(opened, login))
     }
     await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
@@ -372,12 +377,47 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
   ctx.state.set(KV.github.cursor(number), cursorAt(round.started))
   ctx.threads.patch(`github:${number}`, { pollError: undefined })
 }
+/**
+ * Reads the labels of the Issues and pull requests the waiting tickets come from, so a priority label changed on one moves it
+ * in the launch queue. A ticket whose launch started keeps the place it started in, and an Issue GitHub cannot be read leaves
+ * every priority as it was, so the queue keeps the order it had.
+ */
+async function syncPriorities(ctx: SourceContext, round: Round): Promise<void> {
+  for (const ticket of ctx.tickets.open()) {
+    if (stopped(ctx, round)) return
+    // Only a ticket that waits for its launch has a place in the queue to move.
+    if (ticket.assignments.at(-1)?.state !== 'pending') continue
+    const trigger = ctx.triggers.get(ticket.origin.triggerId)
+    if (trigger?.source !== SOURCE) continue
+    const number = Number(trigger.meta.number)
+    if (!number) continue
+    try {
+      const { priority, anomaly } = priorityOfLabels((await readIssue(ctx, round, number)).labels.map(label => label.name))
+      // The Thread keeps what the labels state, so the contradiction of several of them is recorded on the Issue itself.
+      ctx.threads.patch(`github:${number}`, { priority, priorityAnomaly: anomaly })
+      if (priority !== (ticket.priority ?? DEFAULT_PRIORITY)) ctx.tickets.setPriority(ticket.id, priority)
+    }
+    catch (error) { failed(ctx, round, number, error) }
+  }
+}
 /** Reads and observes a PR at most once per polling round. */
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   let read = round.pulls.get(number)
   if (!read) {
     read = readPull(ctx, number, round.signal).then(async pr => { await observePull(ctx, pr); return pr })
     round.pulls.set(number, read)
+  }
+  return read
+}
+/**
+ * Reads the Issue of a number at most once per polling round; a pull request is an Issue too, and its labels state
+ * the priority of the work it starts.
+ */
+function readIssue(ctx: SourceContext, round: Round, number: number): Promise<GithubIssue> {
+  let read = round.issues.get(number)
+  if (!read) {
+    read = ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
+    round.issues.set(number, read)
   }
   return read
 }

@@ -5,6 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
+import { DEFAULT_PRIORITY, type Priority } from '../core/priority.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
@@ -64,7 +65,7 @@ export interface ExecutorHost {
     | 'assignmentInterrupted'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
-  readonly effects: Pick<Effects, 'enqueue' | 'handle'>
+  readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'reprioritize'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
@@ -262,7 +263,17 @@ export class DshExecutor implements Executor {
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
-    this.host.effects.enqueue('launch', assignment.id, { ticketId: ticket.id, assignmentId: assignment.id })
+    this.host.effects.enqueue('launch', assignment.id, { ticketId: ticket.id, assignmentId: assignment.id },
+      ticket.priority ?? DEFAULT_PRIORITY)
+  }
+  /**
+   * Moves the launch a waiting ticket has queued to another priority, so it takes its new place in the queue:
+   * a launch that started keeps the place it started in, and a ticket whose assignment is not pending has nothing queued.
+   */
+  reprioritize(ticket: Ticket, priority: Priority): void {
+    const assignment = latestAssignment(ticket)
+    if (!assignment || assignment.state !== 'pending') return
+    this.host.effects.reprioritize('launch', assignment.id, priority)
   }
   /** Enqueues a `delivery` effect to steer pending inputs into `ticket`'s running worker session. */
   deliver(ticket: Ticket, _assignment: Assignment): void { this.host.effects.enqueue('delivery', ticket.id, { ticketId: ticket.id }) }

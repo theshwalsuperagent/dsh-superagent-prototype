@@ -2,6 +2,7 @@
 import { z } from 'zod'
 import { key, type ChannelRef, type Trigger } from '../core/index.ts'
 import { escapeRegExp, sameName } from '../infra/text.ts'
+import { priorityOfLabels } from './github-priority.ts'
 
 export const SOURCE = 'github'
 /** GitHub reply address: issue/PR conversation, or a review thread when `url` points at a discussion comment. */
@@ -34,10 +35,11 @@ export type GithubComment = z.infer<typeof CommentSchema>
 /** An Issue as `issues/<number>` returns it; GitHub sets `pull_request` when the number is a pull request. */
 export const IssueSchema = CommentSchema.extend({
   number: z.number(), title: z.string(), state: z.string(), created_at: z.string(), html_url: z.string(),
+  labels: z.looseObject({ name: z.string() }).array().default([]),
   pull_request: z.looseObject({ url: z.string() }).nullish(),
 })
 export type GithubIssue = z.infer<typeof IssueSchema>
-type Opened = Pick<GithubIssue, 'number' | 'title' | 'body' | 'user' | 'created_at' | 'html_url'>
+type Opened = Pick<GithubIssue, 'number' | 'title' | 'body' | 'user' | 'created_at' | 'html_url' | 'labels'>
 export interface PullRef { number: number; isPr: boolean; url?: string; prAuthor?: string }
 /**
  * True when GitHub reports the account as a regular user rather than a bot or GitHub App.
@@ -81,10 +83,13 @@ export function commentTrigger(comment: GithubComment, ref: PullRef, kind: 'conv
  */
 export function issueTrigger(issue: Opened, agent: string): Trigger {
   const body = issue.body ?? ''
+  // The priority labels of the issue state how urgent the work it starts is; an issue without one states none.
+  const { priority, stated } = priorityOfLabels(issue.labels.map(label => label.name))
   return { id: key('github-issue', String(issue.number)), source: SOURCE,
     threads: [{ source: SOURCE, id: String(issue.number) }], ...author(issue.user, agent), at: issue.created_at,
     text: `${issue.title}\n\n${body}`,
     ...(mentions(body, agent) ? { addressed: 'mention' as const } : {}),
+    ...(stated ? { priority } : {}),
     channel: githubChannel(issue.number, issue.html_url), url: issue.html_url, meta: { number: issue.number, isPr: false, kind: 'issue' } }
 }
 /**

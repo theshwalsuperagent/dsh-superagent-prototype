@@ -79,11 +79,12 @@ export class Store implements Repositories {
               PRIMARY KEY (thread, id));
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
-              since TEXT NOT NULL, PRIMARY KEY (kind, key));
+              since TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 2, PRIMARY KEY (kind, key));
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
+            CREATE INDEX IF NOT EXISTS effect_priority ON effect(kind, priority, seq);
           `)
           this.addColumns()
           if (migrating) migrateTo11(this)
@@ -117,6 +118,8 @@ export class Store implements Repositories {
       }
     }
     if (!columns('effect').has('generation')) this.db.exec('ALTER TABLE effect ADD COLUMN generation INTEGER NOT NULL DEFAULT 0')
+    // The queue orders a kind by the priority a row waits with, which older databases hold as the default.
+    if (!columns('effect').has('priority')) this.db.exec('ALTER TABLE effect ADD COLUMN priority INTEGER NOT NULL DEFAULT 2')
   }
   /** Closes the underlying SQLite database connection. */
   close(): void { this.db.close() }

@@ -697,10 +697,11 @@ describe('github source', () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     const pr = { ...openPull(9), body: '@agent-bot please review', created_at: '2026-09-09T00:00:00Z' }
-    github(h, { notifications: [notification(9, 'pulls')], 'pulls/9': pr })
+    // The Issue of the pull request carries its labels, which state the priority of the work it starts.
+    github(h, { notifications: [notification(9, 'pulls')], 'pulls/9': pr, 'issues/9': issue(9, { pull_request: { url: 'x' } }) })
     await pollRound(h)
     const opened = h.receive.mock.calls.map(([trigger]) => trigger).filter(trigger => trigger.meta.kind === 'pull')
-    const id = issueTrigger({ ...pr, id: 9 } as GithubIssue, 'agent-bot').id
+    const id = issueTrigger({ ...pr, id: 9, labels: [] } as GithubIssue, 'agent-bot').id
     expect(opened).toEqual([expect.objectContaining({ id, addressed: 'mention', actor: { source: 'github', id: 'carol' },
       meta: expect.objectContaining({ number: 9, isPr: true, prAuthor: 'carol' }) })])
     // The agent's own PR, and one opened before the cursor, bring no description.
@@ -712,6 +713,41 @@ describe('github source', () => {
     github(h, { notifications: [{ ...notification(9, 'pulls'), updated_at: '2026-09-11T00:00:00Z' }], 'pulls/9': pr })
     await pollRound(h)
     expect(h.receive.mock.calls.filter(([trigger]) => trigger.meta.kind === 'pull')).toEqual([])
+    h.store.close()
+  })
+  it('states the priority of an Issue in the Trigger of its body', async () => {
+    const h = host()
+    notify(h, [issue(12, { body: '@agent-bot please fix the login', labels: [{ name: 'priority/P1' }] })])
+    await pollRound(h)
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({ id: key('github-issue', '12'), priority: 1 })
+    h.store.close()
+  })
+  it('moves a waiting ticket when the priority label of its Issue changed, and records contradictory labels', async () => {
+    const h = host()
+    const trigger: Trigger = { id: 'github-issue-12', source: 'github', threads: [{ source: 'github', id: '12' }],
+      actor: { source: 'github', id: 'alice' }, human: true, at: '2026-09-09T00:00:00Z', text: 'Fix the login',
+      meta: { number: 12, isPr: false, kind: 'issue' } }
+    h.store.triggers.save(trigger)
+    h.store.tickets.save({ ...openTicket('t12'), priority: 2, assignments: [{ id: 'a12', state: 'pending', createdAt: '2026-09-09T00:00:00Z' }],
+      origin: { triggerId: trigger.id, triggerIds: [trigger.id] } })
+    notify(h, [issue(12, { labels: [{ name: 'priority/P0' }, { name: 'priority/P3' }] })])
+    await pollRound(h)
+    // The most urgent of the contradictory labels applies, and the contradiction is recorded on the Issue's thread.
+    expect(h.store.tickets.get('t12')!.priority).toBe(0)
+    expect(h.store.threads.get('github:12')!.meta).toMatchObject({ priority: 0, priorityAnomaly: expect.stringContaining('P0') })
+    h.store.close()
+  })
+  it('keeps the priority of a waiting ticket when GitHub cannot read its Issue', async () => {
+    const h = host()
+    const trigger: Trigger = { id: 'github-issue-12', source: 'github', threads: [{ source: 'github', id: '12' }],
+      actor: { source: 'github', id: 'alice' }, human: true, at: '2026-09-09T00:00:00Z', text: 'Fix the login',
+      meta: { number: 12, isPr: false, kind: 'issue' } }
+    h.store.triggers.save(trigger)
+    h.store.tickets.save({ ...openTicket('t12'), priority: 2, assignments: [{ id: 'a12', state: 'pending', createdAt: '2026-09-09T00:00:00Z' }],
+      origin: { triggerId: trigger.id, triggerIds: [trigger.id] } })
+    github(h, { notifications: [], 'issues/12': refused(404, 'Not Found') })
+    await expect(pollRound(h)).rejects.toThrow('#12')
+    expect(h.store.tickets.get('t12')!.priority).toBe(2)
     h.store.close()
   })
   it('reads a subscribed default-branch CI Thread as no Issue, and keeps no poll error on it', async () => {
@@ -814,7 +850,7 @@ describe('github source', () => {
   /** An Issue as GitHub returns it, opened by alice. */
   const issue = (number: number, fields: Partial<GithubIssue> = {}): GithubIssue => ({ id: 1000 + number, number, title: 'Login fails',
     body: 'details', state: 'open', created_at: '2026-09-09T00:00:00Z', html_url: `https://github.com/acme/widgets/issues/${number}`,
-    user: { login: 'alice', type: 'User' }, ...fields })
+    user: { login: 'alice', type: 'User' }, labels: [], ...fields })
   /** GitHub as `pollRound` reads it after `since`: one notification per Issue, the Issues, and their conversation comments by number. */
   function notify(h: ReturnType<typeof host>, issues: GithubIssue[], comments: Record<number, GithubComment[]> = {},
     since = '2026-09-08T00:00:00.000Z') {
@@ -1190,7 +1226,7 @@ describe('observing the GitHub repository', () => {
   const at = (hour: number) => new Date(Math.floor(Date.now() / 86_400_000 - 2) * 86_400_000 + hour * 3_600_000).toISOString()
   const issue = (number: number, fields: Partial<GithubIssue> = {}): GithubIssue => ({ id: 1000 + number, number, title: `Issue ${number}`,
     body: 'details', state: 'open', created_at: at(0), updated_at: at(0),
-    html_url: `https://github.com/acme/widgets/issues/${number}`, user: { login: 'carol', type: 'User' }, ...fields })
+    html_url: `https://github.com/acme/widgets/issues/${number}`, user: { login: 'carol', type: 'User' }, labels: [], ...fields })
   const observe = (h: ReturnType<typeof host>, config: Record<string, boolean>) =>
     h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources, github: { enabled: true, config } } })
   /** GitHub as the repository's lists and its default branch answer; a request with the ETag of an unchanged list answers 304. */

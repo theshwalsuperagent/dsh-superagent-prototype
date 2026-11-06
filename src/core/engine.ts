@@ -2,6 +2,7 @@
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
 import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Priority } from './priority.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -164,6 +165,15 @@ export class Engine {
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
   retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
+  /**
+   * A Source's fact that the priority of the work a ticket does changed, such as an issue's priority label: a ticket that
+   * waits for its launch takes its new place in the queue, without a new ticket or assignment, and one whose launch already
+   * started keeps the place it started in.
+   * @throws UserError when the ticket is unknown.
+   */
+  setPriority(ticketId: string, priority: Priority): void {
+    this.repo.atomic(() => { this.tickets.setPriority(ticketId, priority) })
+  }
 
   // The Executor
 
@@ -258,7 +268,7 @@ export class Engine {
 }
 
 /** What Sources ask and tell the Engine. */
-export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
+export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed' | 'setPriority'>
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */

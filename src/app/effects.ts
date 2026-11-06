@@ -6,6 +6,7 @@ export class Later extends Error {}
 /** Consecutive failures before an effect kind reports an error, matching the Sources poll failure threshold. */
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
+import { DEFAULT_PRIORITY } from '../core/priority.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
@@ -42,6 +43,8 @@ type Task = { kind: EffectKind; key: string; done: Promise<void> }
 /**
  * Durable SQLite-backed queue that persists side effects inside command transactions and dispatches them after commit.
  * Coordinates per-kind handlers, concurrency limits, exponential backoff, and health reporting for MasterAssessor, DshExecutor, Sessions, and Outbox.
+ * The rows of a kind wait in the order they were queued, and the most urgent row first: a row states the priority it waits with,
+ * which the launch queue takes from the ticket it launches, so a more urgent ticket starts before an older, less urgent one.
  */
 export class Effects {
   private readonly handlers = new Map<EffectKind, Handler<never>>()
@@ -58,10 +61,18 @@ export class Effects {
     this.seq = Number(store.db.prepare('SELECT IFNULL(MAX(seq), 0) AS seq FROM effect').get()?.seq ?? 0)
   }
   /** Upserts an effect in the caller's transaction, coalescing with any waiting row of the same kind and key while keeping its queue position. */
-  enqueue<K extends EffectKind>(kind: K, key: string, payload: EffectPayloads[K]): void {
-    this.store.db.prepare(`INSERT INTO effect (kind, key, value, seq, due, since) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE
-      SET value = excluded.value, generation = generation + 1, attempts = 0, error = '', due = excluded.due`)
-      .run(kind, key, JSON.stringify(payload), ++this.seq, this.now(), new Date(this.now()).toISOString())
+  enqueue<K extends EffectKind>(kind: K, key: string, payload: EffectPayloads[K], priority: number = DEFAULT_PRIORITY): void {
+    this.store.db.prepare(`INSERT INTO effect (kind, key, value, seq, due, since, priority) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE
+      SET value = excluded.value, generation = generation + 1, attempts = 0, error = '', due = excluded.due, priority = excluded.priority`)
+      .run(kind, key, JSON.stringify(payload), ++this.seq, this.now(), new Date(this.now()).toISOString(), priority)
+    this.kick()
+  }
+  /**
+   * Moves a waiting row to another priority, so a launch takes its new place in the queue without a new row:
+   * the row keeps its queue position among the rows of the same priority, and its payload and failures are untouched.
+   */
+  reprioritize(kind: EffectKind, key: string, priority: number): void {
+    this.store.db.prepare('UPDATE effect SET priority = ? WHERE kind = ? AND key = ?').run(priority, kind, key)
     this.kick()
   }
   handle<K extends EffectKind>(kind: K, run: Handler<K>['run'], options: Options<K> = {}): void {
@@ -108,7 +119,7 @@ export class Effects {
         // Ordered kinds block behind their oldest row even when it is not yet due; limit() is queried only after ready rows exist.
         const rows = (handler.ordered
           ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
-          : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY seq LIMIT ?')
+          : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY priority, seq LIMIT ?')
             .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
         const ready = handler.ordered && running.size ? [] : rows.filter(row => row.due <= this.now() && !running.has(row.key))
         let room = ready.length ? handler.limit() - running.size : 0
