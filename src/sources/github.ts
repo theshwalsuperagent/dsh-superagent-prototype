@@ -12,6 +12,7 @@ import type { GithubComment, PullRef } from './github-trigger.ts'
 import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
+import { githubPriority } from './github-priority.ts'
 import { cursorAt, pause, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { z } from 'zod'
@@ -228,7 +229,9 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
     if (id === 'issues') {
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
-      if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
+      if (!issue.success) continue
+      savePriority(ctx, issue.data.number, issue.data.labels)
+      if (!fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
       await ctx.receive(pr ? pullTrigger(issue.data, login) : issueTrigger(issue.data, login))
       nameThread(ctx, issue.data.number, issue.data.title)
       continue
@@ -282,6 +285,8 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
+  // Pending launches can change GitHub labels without receiving a comment.
+  await pollPendingPriorities(ctx, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error
   const { count, interval } = notified.value
@@ -344,9 +349,10 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
   let isPr = item.pr
-  if (!isPr) {
-    const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
-    // `issues/<n>` also returns PRs with `pull_request` set; handle them in the PR branch below.
+    if (!isPr) {
+      const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
+      savePriority(ctx, number, issue.labels)
+      // `issues/<n>` also returns PRs with `pull_request` set; handle them in the PR branch below.
     isPr = !!issue.pull_request
     if (!isPr) {
       // An Issue opened by someone other than the agent since the cursor brings its body so a mention in it reaches the gate.
@@ -376,7 +382,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   let read = round.pulls.get(number)
   if (!read) {
-    read = readPull(ctx, number, round.signal).then(async pr => { await observePull(ctx, pr); return pr })
+    read = readPull(ctx, number, round.signal).then(async pr => { savePriority(ctx, number, pr.labels); await observePull(ctx, pr); return pr })
     round.pulls.set(number, read)
   }
   return read
@@ -401,6 +407,47 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
     }
   }
 }
+/** Persist priority facts with the GitHub source; this is independent of the original Trigger's immutable text. */
+function savePriority(ctx: SourceContext, number: number, labels: unknown): void {
+  const priority = githubPriority(labels)
+  if (!priority) return
+  const previous = ctx.state.get(KV.github.priority(number))
+  const unchanged = previous?.level === priority.level && previous.conflict === priority.conflict
+  ctx.state.set(KV.github.priority(number), { ...priority, checkedAt: new Date().toISOString() })
+  if (unchanged) return
+  ctx.threads.describe(`github:${number}`, { facts: { priority: {
+    label: 'Priority', value: priority.conflict ? 'P2 (conflicting labels)' : `P${priority.level}`,
+    ...priority.conflict ? { problem: true as const } : {},
+  } } })
+}
+
+/** Only pending Github-origin tickets need refreshes; active workers are never preempted. */
+export async function pollPendingPriorities(ctx: SourceContext, round = newRound()): Promise<void> {
+  const numbers = new Set<number>()
+  for (const ticket of ctx.tickets.open()) {
+    if (ticket.assignments.at(-1)?.state !== 'pending') continue
+    const origin = ctx.triggers.get(ticket.origin.triggerId)
+    if (origin?.source !== SOURCE) continue
+    const number = origin.meta.number
+    if (typeof number === 'number' && Number.isSafeInteger(number) && number > 0) numbers.add(number)
+  }
+  // Bounded refresh: at most 30 GitHub API calls per poll; oldest cached results first.
+  // Newly created issues/PRs have already had their labels read by the normal source.
+  const candidates = [...numbers].map(number => ({ number, seen: Date.parse(ctx.state.get(KV.github.priority(number))?.checkedAt ?? '') || 0 }))
+    .filter(item => Date.now() - item.seen >= 120_000)
+    .sort((a, b) => a.seen - b.seen || a.number - b.number).slice(0, 30)
+  for (const { number } of candidates) {
+    if (stopped(ctx, round)) return
+    try {
+      const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
+      savePriority(ctx, number, issue.labels)
+    } catch (error) {
+      if (!stopped(ctx, round)) round.failures.push(`Priority #${number}: ${String(error)}`)
+      // Keep the last confirmed priority, or default to P2, on transient GitHub errors.
+    }
+  }
+}
+
 export async function pollTicketPulls(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   const numbers = [...new Set(ctx.tickets.open().flatMap(ticket => pullsOf(ticket, true)))]
   for (const number of numbers) {

@@ -7,6 +7,7 @@ export class Later extends Error {}
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { Store } from './store.ts'
+import { rankLaunchRows } from './launch-ranking.ts'
 
 export interface EffectPayloads {
   /** Build an Eval's candidate card and relay it to the main Session; the key is the Eval ID. */
@@ -27,6 +28,8 @@ interface Handler<K extends EffectKind> {
   run: (payload: EffectPayloads[K], key: string) => Promise<void>
   /** How many may run at once now; 0 holds the kind, such as while processing is paused. */
   limit: () => number
+  /** Optional priority for ready effects; evaluated again at each dispatch. Lower is earlier. */
+  priority?: (payload: EffectPayloads[K]) => number
   /** Initial and maximum retry backoff delays, in milliseconds. */
   retry: readonly [number, number]
   /** Effects run one at a time in queue order, and a failed one holds back later rows of the same kind. */
@@ -34,9 +37,9 @@ interface Handler<K extends EffectKind> {
   /** When true, repeated failures do not mark the effect kind's health entry as `error` (used when failures are already surfaced on a ticket). */
   quiet: boolean
 }
-type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet'>>
+type Options<K extends EffectKind> = Partial<Pick<Handler<K>, 'limit' | 'retry' | 'ordered' | 'quiet' | 'priority'>>
 /** `seq` preserves the row's queue position; `generation` increments on payload updates so a running attempt does not delete a newer payload. */
-interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number }
+interface Row { key: string; value: string; seq: number; generation: number; attempts: number; due: number; since: string }
 type Task = { kind: EffectKind; key: string; done: Promise<void> }
 
 /**
@@ -67,8 +70,8 @@ export class Effects {
   handle<K extends EffectKind>(kind: K, run: Handler<K>['run'], options: Options<K> = {}): void {
     if (this.handlers.has(kind)) throw new Error(`The ${kind} effects already have a handler`)
     this.health.set(kind, this.board.claim(kind))
-    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false } = options
-    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet } as unknown as Handler<never>)
+    const { limit = () => 1, retry = [2000, 60_000], ordered = false, quiet = false, priority } = options
+    this.handlers.set(kind, { run, limit: ordered ? () => Math.min(1, limit()) : limit, retry, ordered, quiet, priority } as unknown as Handler<never>)
     this.report(kind)
     this.kick()
   }
@@ -107,12 +110,18 @@ export class Effects {
         const running = new Set([...this.tasks].filter(task => task.kind === kind).map(task => task.key))
         // Ordered kinds block behind their oldest row even when it is not yet due; limit() is queried only after ready rows exist.
         const rows = (handler.ordered
-          ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
-          : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY seq LIMIT ?')
-            .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
+          ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due, since FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)
+          : handler.priority
+            // Do not use the FIFO LIMIT before ranking: a late P0 must be visible even behind hundreds of P4 rows.
+            ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due, since FROM effect WHERE kind = ? AND due <= ? ORDER BY seq')
+              .all(kind, this.now())
+            : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due, since FROM effect WHERE kind = ? AND due <= ? ORDER BY seq LIMIT ?')
+              .all(kind, this.now(), 16 + running.size)) as unknown as Row[]
         const ready = handler.ordered && running.size ? [] : rows.filter(row => row.due <= this.now() && !running.has(row.key))
-        let room = ready.length ? handler.limit() - running.size : 0
-        for (const row of ready) {
+        const ranked = handler.priority
+          ? rankLaunchRows(ready, row => handler.priority!(JSON.parse(row.value) as never), this.now()) : ready
+        let room = ranked.length ? handler.limit() - running.size : 0
+        for (const row of ranked) {
           if (room-- <= 0) break
           this.run(kind, handler, row)
         }
